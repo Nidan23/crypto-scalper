@@ -61,6 +61,17 @@ class Config:
     orderbook_snapshot_interval: int = 10  # seconds between snapshots
     orderbook_cache_dir: str = "ob_cache"
 
+    # Bybit order book data
+    bybit_ob_cache_dir: str = "ob_cache/bybit"
+    bybit_ob_enabled: bool = True
+    bybit_ob_symbol: str = "BTCUSDT"
+    bybit_ob_auto_sync: bool = True  # auto-download missing days before training
+
+    # Regime detection
+    regime_mode: str = "off"  # "strict", "loose", "off"
+    regime_strict_confidence: float = 0.70
+    regime_loose_confidence: float = 0.50
+
     # Paths
     model_dir: str = "models"
     data_dir: str = "data_cache"

@@ -1,9 +1,11 @@
 """argparse CLI for the crypto-scalping ML system."""
 
 import argparse
+import logging
 import os
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,12 +15,16 @@ from src.config import config
 from src.data.fetcher import fetch_multiple, fetch_ohlcv
 from src.data.features import build_features, create_sequences
 from src.data.pipeline import run_pipeline
+from src.features.regime_features import build_regime_features
 from src.model.predict import (
     load_trained_model,
     predict_single as _predict_single,
 )
+from src.model.regime_detector import _classify_no_trade_reason, train_regime_detector
 from src.model.train import compute_metrics as compute_model_metrics
 from src.strategy.backtest import compute_metrics, plot_equity_curve, run_backtest
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +173,7 @@ def handle_backtest(args: argparse.Namespace) -> None:
     """Run pipeline, train model, backtest, and print a report."""
     symbols: list = args.symbols or config.symbols
     capital: float = args.capital
+    regime_mode: str = getattr(config, "regime_mode", "off")
 
     print(f"Running pipeline for {symbols} ...")
     data = run_pipeline(symbols)
@@ -215,13 +222,9 @@ def handle_backtest(args: argparse.Namespace) -> None:
 
     print(f"Test sequences: {n_test_seqs}")
 
-    # Build per-symbol OHLCV data for the test period.
-    # We estimate the test OHLCV slice by fetching the full data,
-    # building features (to account for dropped NaN rows), and
-    # computing the split positions within the features DataFrame.
-    # We then index back into the original df (which shares the same
-    # DatetimeIndex) to get the raw OHLCV columns.
-    ohlcv_test: dict = {}
+    # Collect per-symbol metadata for train/test split alignment and
+    # OHLCV test data construction.
+    sym_meta: Dict[str, dict] = {}
     for sym in symbols:
         df = fetch_ohlcv(sym)
         features = build_features(df)
@@ -229,23 +232,28 @@ def handle_backtest(args: argparse.Namespace) -> None:
         train_end = int(n_total * config.train_split)
         val_end = train_end + int(n_total * config.val_split)
 
-        # The test portion of the original OHLCV data starts at
-        # val_end (positional split).  We then skip seq_len rows
-        # (because the first seq_len rows of test features are needed
-        # to build the first test sequence).  The remaining
-        # n_test_seqs rows represent the OHLCV bars that correspond
-        # to each test prediction.
+        sym_meta[sym] = {
+            "df": df,
+            "features": features,
+            "n_total": n_total,
+            "train_end": train_end,
+            "val_end": val_end,
+        }
+
+    # Build per-symbol OHLCV data for the test period.
+    ohlcv_test: dict = {}
+    for sym in symbols:
+        meta = sym_meta[sym]
+        df = meta["df"]
+        features = meta["features"]
+        val_end = meta["val_end"]
         test_start_idx = val_end + config.seq_len
+
         if test_start_idx + n_test_seqs > len(features):
-            # Not enough rows — use what we can.
             n_available = len(features) - test_start_idx
             if n_available < 1:
-                # Fallback: use the last n_test_seqs rows of the
-                # original OHLCV.
                 ohlcv_slice = df.iloc[-n_test_seqs:]
             else:
-                # Get timestamps from the features slice, then look up
-                # raw OHLCV columns in the original df.
                 ts = features.iloc[
                     test_start_idx : test_start_idx + n_available
                 ].index
@@ -258,7 +266,6 @@ def handle_backtest(args: argparse.Namespace) -> None:
 
         ohlcv_test[sym] = ohlcv_slice
 
-    # Check that we have enough rows.
     min_rows = min(len(v) for v in ohlcv_test.values())
     if min_rows < 2:
         print(
@@ -267,18 +274,136 @@ def handle_backtest(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # Truncate predictions to match.
-    predictions: dict = {}
-    for sym in symbols:
-        predictions[sym] = test_probs[:min_rows]
+    # --- Regime Detection Gate ---
+    regime_mask: Optional[np.ndarray] = None
+    regime_stats: Optional[dict] = None
 
-    # Also truncate y_test.
-    y_test = data["y_test"][:min_rows]
+    if regime_mode != "off":
+        # Build aligned regime features for all symbols.
+        all_regime_frames: List[pd.DataFrame] = []
+        train_end_total = 0
+        val_end_total = 0
+
+        for sym in symbols:
+            meta = sym_meta[sym]
+            regime_feat = build_regime_features(meta["df"])
+            # Align to TA feature index by reindexing.
+            aligned = regime_feat.reindex(meta["features"].index)
+            train_end_total += meta["train_end"]
+            val_end_total += meta["val_end"]
+            all_regime_frames.append(aligned)
+
+        combined_regime = pd.concat(all_regime_frames, axis=0).reset_index(drop=True)
+        # Forward-fill any NaNs introduced by reindex alignment.
+        combined_regime = combined_regime.ffill().bfill()
+
+        train_regime = combined_regime.iloc[:train_end_total]
+        test_regime = combined_regime.iloc[val_end_total:]
+
+        try:
+            confidence = (
+                config.regime_strict_confidence if regime_mode == "strict"
+                else config.regime_loose_confidence
+            )
+
+            detector = train_regime_detector(train_regime)
+            regime_path = os.path.join(config.model_dir, "regime_detector.pkl")
+            os.makedirs(config.model_dir, exist_ok=True)
+            detector.save(regime_path)
+
+            preds, probs = detector.predict(test_regime)
+            n_regime = len(preds)
+
+            # Build sequence-level mask: sequence i uses regime at row i+seq_len-1.
+            n_mask = min(min_rows, n_regime - config.seq_len + 1)
+            regime_mask = np.ones(n_mask, dtype=bool)
+            reasons: Dict[str, int] = {}
+
+            for i in range(n_mask):
+                regime_idx = i + config.seq_len - 1
+                if regime_idx >= n_regime:
+                    break
+                is_trade = bool(preds[regime_idx])
+                trade_prob = float(probs[regime_idx])
+
+                if not is_trade or trade_prob < confidence:
+                    regime_mask[i] = False
+                    reason = _classify_no_trade_reason(test_regime.iloc[regime_idx])
+                    reasons[reason] = reasons.get(reason, 0) + 1
+
+            total_filtered = int((~regime_mask).sum())
+            regime_stats = {
+                "mode": regime_mode,
+                "confidence_threshold": confidence,
+                "total_checked": n_mask,
+                "total_filtered": total_filtered,
+                "filter_rate": total_filtered / max(n_mask, 1),
+                "reasons": reasons,
+            }
+        except Exception as exc:
+            logger.warning("Regime detector failed: %s — trading everything.", exc)
+            regime_mask = None
+            regime_stats = {"mode": regime_mode, "error": str(exc)}
+
+    # --- Apply regime mask ---
+    if regime_mask is not None:
+        # Build filtered per-symbol predictions.
+        predictions: dict = {}
+        for sym in symbols:
+            predictions[sym] = test_probs[:len(regime_mask)][regime_mask]
+
+        # Filter y_test.
+        y_test = data["y_test"][:len(regime_mask)][regime_mask]
+
+        # Filter OHLCV test data to matching rows.
+        ohlcv_test_filtered: dict = {}
+        for sym in symbols:
+            df = ohlcv_test[sym]
+            keep_idx = np.where(regime_mask[:len(df)])[0]
+            ohlcv_test_filtered[sym] = df.iloc[keep_idx]
+        ohlcv_test = ohlcv_test_filtered
+
+        n_filtered = len(y_test)
+        print(f"Test sequences after regime filter: {n_filtered} "
+              f"({regime_stats['total_filtered']} filtered, "
+              f"{regime_stats['filter_rate']:.1%} rate)")
+    else:
+        predictions = {}
+        for sym in symbols:
+            predictions[sym] = test_probs[:min_rows]
+        y_test = data["y_test"][:min_rows]
+        n_filtered = min_rows
+
+    if n_filtered < 2:
+        print(
+            "Error: insufficient sequences after regime filtering.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print(f"Backtesting with ${capital:,.0f} capital "
-          f"({min_rows} steps) ...")
-    result = run_backtest(predictions, y_test, ohlcv_test, capital)
+          f"({n_filtered} steps) ...")
+    result = run_backtest(predictions, y_test, ohlcv_test, capital, regime=regime_mode)
 
+    # --- Print regime stats ---
+    if regime_stats and regime_stats.get("mode") != "off":
+        print(f"\n{'=' * 52}")
+        print(f"  REGIME DETECTION GATE")
+        print(f"{'=' * 52}")
+        print(f"  Mode:              {regime_stats['mode']:>12}")
+        print(f"  Confidence:        {regime_stats.get('confidence_threshold', 0):>12.2f}")
+        print(f"  Checked:           {regime_stats.get('total_checked', 0):>12d}")
+        print(f"  Filtered:          {regime_stats.get('total_filtered', 0):>12d}")
+        print(f"  Filter Rate:       {regime_stats.get('filter_rate', 0):>11.1%}")
+        if regime_stats.get("reasons"):
+            reasons_str = " ".join(
+                f"{k}({v})" for k, v in sorted(
+                    regime_stats["reasons"].items(), key=lambda x: -x[1]
+                )
+            )
+            print(f"  Reasons:           {reasons_str}")
+
+    # --- Backtest results ---
     metrics = result["metrics"]
     print(f"\n{'=' * 52}")
     print(f"  BACKTEST RESULTS")
@@ -377,6 +502,13 @@ def main() -> None:
         default=10000.0,
         help="Initial capital (default: 10000)",
     )
+    backtest_p.add_argument(
+        "--regime",
+        type=str,
+        default=None,
+        choices=["strict", "loose", "off"],
+        help="Regime detection gate: strict, loose, off (default)",
+    )
 
     args = parser.parse_args()
 
@@ -393,6 +525,85 @@ def main() -> None:
         sys.exit(1)
 
     handler(args)
+
+
+# ---------------------------------------------------------------------------
+# Bybit OB fetch handler
+# ---------------------------------------------------------------------------
+
+
+def handle_bybit_fetch(args: argparse.Namespace) -> None:
+    """Download Bybit historical spot orderbook data and cache as parquet."""
+    from src.data.bybit_ob_loader import (
+        _create_browser_session,
+        available_date_range,
+        gather_file_list,
+        load_range,
+    )
+    from src.config import config as cfg
+
+    symbol: str = args.symbol
+    start: str = args.start
+    end: str = args.end if args.end else pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
+    depth: int = args.depth
+    workers: int = args.workers
+    dry_run: bool = args.dry_run
+    cache_dir = Path(cfg.bybit_ob_cache_dir)
+
+    print(f"Bybit OB Download")
+    print(f"  Symbol:  {symbol}")
+    print(f"  Depth:   {depth}")
+    print()
+
+    print("Getting browser session ...")
+    session = _create_browser_session()
+
+    print("Checking available date range ...")
+    earliest, latest = available_date_range(session, symbol)
+    print(f"  Available: {earliest} → {latest}")
+    print(f"  Requested: {start} → {end}")
+
+    # Clamp to available range.
+    start_dt = max(pd.Timestamp(start), pd.Timestamp(earliest))
+    end_dt = min(pd.Timestamp(end), pd.Timestamp(latest))
+    if start_dt > end_dt:
+        print(f"Error: no data in requested range (available: {earliest} → {latest})")
+        return
+
+    start = start_dt.strftime("%Y-%m-%d")
+    end = end_dt.strftime("%Y-%m-%d")
+    n_days = (end_dt - start_dt).days + 1
+
+    print(f"  Effective: {start} → {end} ({n_days} days)")
+
+    files = gather_file_list(session, symbol, start, end)
+    total_size = sum(int(f.get("size", 0)) for f in files)
+    print(f"  Files:    {len(files)}")
+    print(f"  Size:     {total_size / 1e9:.1f} GB")
+
+    if dry_run:
+        print("\n  [DRY RUN] No files downloaded.")
+        print(f"  Cache dir: {cache_dir.resolve()}")
+        return
+
+    print(f"\nDownloading {n_days} days ({workers} workers) ...")
+    print(f"  Cache dir: {cache_dir.resolve()}")
+    print()
+
+    df = load_range(
+        session=session,
+        symbol=symbol,
+        start_date=start,
+        end_date=end,
+        cache_dir=cache_dir,
+        depth=depth,
+        max_workers=workers,
+    )
+
+    gb = df.memory_usage(deep=True).sum() / 1e9
+    print(f"\nDone. Loaded {len(df):,} snapshots ({gb:.1f} GB RAM)")
+    print(f"  Date range: {df.index.min()} → {df.index.max()}")
+    print(f"  Cached to:  {cache_dir.resolve()}")
 
 
 if __name__ == "__main__":

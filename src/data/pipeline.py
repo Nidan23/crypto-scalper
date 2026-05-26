@@ -32,9 +32,12 @@ def _merge_ob_features(
 ) -> pd.DataFrame:
     """Attempt to fetch OB data and merge with TA features.
 
+    Tries Bybit historical data first (if available), then falls back to
+    live CCXT snapshots via ``OrderBookFetcher``.
+
     Args:
         features: TA feature DataFrame (index = DatetimeIndex).
-        symbol: Trading pair string.
+        symbol: Trading pair string (e.g. ``"BTC/USDT"``).
         raw_ohlcv: Raw OHLCV DataFrame (for time-range reference).
 
     Returns:
@@ -45,17 +48,93 @@ def _merge_ob_features(
     if not use_ob:
         return features
 
+    # Time range from the feature index (after NaN trimming).
+    start_dt = features.index.min()
+    end_dt = features.index.max()
+    depth = config.orderbook_depth
+
+    # --- Path 1: Try Bybit historical OB data ---
+    bybit_enabled = getattr(config, "bybit_ob_enabled", True)
+    if bybit_enabled:
+        try:
+            # Quick guard: skip if no cache files cover our date range.
+            from pathlib import Path as _Path
+            _cache_dir = _Path(getattr(config, "bybit_ob_cache_dir", "ob_cache/bybit"))
+            bybit_sym = symbol.replace("/", "")
+            safe = bybit_sym.replace("/", "_")
+            # Check if ANY parquet file exists for this symbol whose date
+            # overlaps with our range.
+            parquets = sorted(_cache_dir.glob(f"{safe}_*.parquet"))
+            if not parquets:
+                logger.debug("Bybit OB cache empty — skipping.")
+            else:
+                # Crude check: does the earliest/latest cached file bracket our range?
+                pqt_dates: list[pd.Timestamp] = []
+                for p in parquets:
+                    try:
+                        # Filename: BTCUSDT_2025-06-15.parquet
+                        date_str = p.stem.split("_")[-1]
+                        pqt_dates.append(pd.Timestamp(date_str))
+                    except (ValueError, IndexError):
+                        continue
+                if not pqt_dates:
+                    logger.debug("Bybit OB cache has unparseable files — skipping.")
+                else:
+                    cache_start = min(pqt_dates)
+                    cache_end = max(pqt_dates)
+                    if end_dt < cache_start or start_dt > cache_end:
+                        logger.debug(
+                            "Bybit OB cache [%s, %s] does not cover requested [%s, %s] — skipping.",
+                            cache_start.date(), cache_end.date(), start_dt.date(), end_dt.date(),
+                        )
+                    else:
+                        from src.data.bybit_ob_loader import load_bybit_ob_for_range
+
+                        auto_sync = getattr(config, "bybit_ob_auto_sync", True)
+
+                        logger.info(
+                            "Attempting Bybit OB data for %s [%s, %s] ...",
+                            bybit_sym, start_dt, end_dt,
+                        )
+                        snapshots = load_bybit_ob_for_range(
+                            symbol=bybit_sym,
+                            start_dt=start_dt,
+                            end_dt=end_dt,
+                            depth=depth,
+                            auto_sync=auto_sync,
+                        )
+                        if snapshots is not None and not snapshots.empty:
+                            ob_feat = compute_ob_features(snapshots, depth=depth)
+                            if not ob_feat.empty:
+                                ob_agg = aggregate_to_candles(ob_feat, features.index)
+                                merged = features.join(ob_agg, how="left")
+                                ob_cols = [c for c in ob_agg.columns if c not in features.columns]
+                                logger.info(
+                                    "Merged %d Bybit OB feature columns for %s — "
+                                    "%d/%d candles have OB data.",
+                                    len(ob_cols), symbol,
+                                    ob_agg.dropna(how="all").dropna().notna().any(axis=1).sum(),
+                                    len(ob_agg),
+                                )
+                                return merged
+                            else:
+                                logger.info("Bybit OB features empty for %s.", symbol)
+                        else:
+                            logger.info("No Bybit OB data available for %s in range.", symbol)
+        except Exception as exc:
+            logger.warning(
+                "Bybit OB fetch failed for %s: %s — trying CCXT fallback.",
+                symbol, exc,
+            )
+
+    # --- Path 2: Fall back to CCXT OrderBookFetcher ---
     try:
         from src.data.orderbook import OrderBookFetcher
 
         fetcher = OrderBookFetcher(
             exchange_id=config.exchange_id,
-            depth=config.orderbook_depth,
+            depth=depth,
         )
-
-        # Time range from the feature index (after NaN trimming).
-        start_dt = features.index.min()
-        end_dt = features.index.max()
 
         snapshots = fetcher.get_snapshots(symbol, start_dt, end_dt)
 
@@ -66,14 +145,12 @@ def _merge_ob_features(
             )
             return features
 
-        # Compute per-snapshot features and aggregate to candle timestamps.
-        ob_feat = compute_ob_features(snapshots, depth=config.orderbook_depth)
+        ob_feat = compute_ob_features(snapshots, depth=depth)
         if ob_feat.empty:
             return features
 
         ob_agg = aggregate_to_candles(ob_feat, features.index)
 
-        # Merge with TA features on index.
         merged = features.join(ob_agg, how="left")
         ob_cols = [c for c in ob_agg.columns if c not in features.columns]
 
