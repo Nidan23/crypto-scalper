@@ -17,6 +17,7 @@ from src.model.predict import (
     load_trained_model,
     predict_single as _predict_single,
 )
+from src.model.train import compute_metrics as compute_model_metrics
 from src.strategy.backtest import compute_metrics, plot_equity_curve, run_backtest
 
 
@@ -181,6 +182,25 @@ def handle_backtest(args: argparse.Namespace) -> None:
     with torch.no_grad():
         test_logits = model(X_test_t)
     test_probs = test_logits.numpy().flatten()
+
+    # --- Model accuracy metrics on test set ---
+    model_metrics = compute_model_metrics(data["y_test"], test_probs)
+    print(f"\n{'=' * 52}")
+    print(f"  MODEL ACCURACY (TEST SET)")
+    print(f"{'=' * 52}")
+    print(f"  Accuracy:         {model_metrics['accuracy']:>8.4f}")
+    print(f"  Precision:        {model_metrics['precision']:>8.4f}")
+    print(f"  Recall:           {model_metrics['recall']:>8.4f}")
+    print(f"  F1 Score:         {model_metrics['f1']:>8.4f}")
+    print(f"  AUC-ROC:          {model_metrics['auc']:>8.4f}")
+    accuracy = model_metrics['accuracy']
+    if accuracy < 0.55:
+        print(f"\n  Accuracy is below 55%. Suggestions to improve:")
+        print(f"    - Increase lookback_candles (currently {config.lookback_candles})")
+        print(f"    - Try different seq_len values (currently {config.seq_len})")
+        print(f"    - Add more informative features or external data")
+        print(f"    - Tune hidden_dim, num_layers, dropout, learning_rate")
+        print(f"    - Reduce noise in target by using larger timeframe candles")
     n_test_seqs = len(test_probs)
 
     if n_test_seqs == 0:

@@ -7,14 +7,18 @@ class Config:
     # Exchange
     exchange_id: str = "binance"
 
-    # Trading pairs (any base/quote — BTC/USDT, ETH/GBP, SOL/EUR, etc.)
+    # Trading pairs — single-pair focus for accuracy. Add more pairs later.
     symbols: List[str] = field(default_factory=lambda: ["BTC/USDT"])
 
     # Timeframe for OHLCV
     timeframe: str = "1m"
 
     # Data
-    lookback_candles: int = 1000  # candles to fetch per symbol (~16h of 1m data)
+    lookback_candles: int = 50000  # candles to fetch (~35 days of 1m data)
+    target_forward_periods: int = 1  # predict next candle
+    augmentation_enabled: bool = True
+    augmentation_factor: int = 2  # copies per original sequence
+    augmentation_noise_std: float = 0.02  # std dev of Gaussian jitter
     train_split: float = 0.7
     val_split: float = 0.15  # test gets remainder
 
@@ -26,6 +30,13 @@ class Config:
     macd_signal: int = 9
     bb_period: int = 20
     bb_std: float = 2.0
+    atr_period: int = 14
+    stoch_k_period: int = 14
+    stoch_d_period: int = 3
+    obv_period: int = 20
+    ema_fast: int = 9
+    ema_slow: int = 21
+    roc_periods: List[int] = field(default_factory=lambda: [5, 10, 20])
 
     # Model
     hidden_dim: int = 128

@@ -11,6 +11,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
 from src.config import config
+from src.data.augmentation import augment_sequences
 from src.data.fetcher import fetch_multiple
 from src.data.features import build_features, build_target, create_sequences, normalize_data
 
@@ -74,10 +75,10 @@ def run_pipeline(
             raise RuntimeError(f"No OHLCV data available for symbol '{symbol}'.")
 
         features = build_features(df)
-        targets = build_target(df)
+        targets = build_target(df, forward_periods=config.target_forward_periods)
 
-        # Align features and targets: targets has NaN only in the last row
-        # (no next candle to compare).  Features have NaN rows dropped from
+        # Align features and targets: targets has NaN in the last N rows
+        # (no future candles to compare).  Features have NaN rows dropped from
         # the front.  The intersection gives fully valid pairs.
         valid_idx = features.index.intersection(targets.dropna().index)
         if len(valid_idx) == 0:
@@ -142,6 +143,18 @@ def run_pipeline(
 
     _check_seq_viable(len(scaled_train), "Train")
     X_train, y_train = create_sequences(scaled_train, train_targets.values, seq_len)
+
+    # ------------------------------------------------------------------
+    # 6a. Augment training data (optional, train split only — no leakage)
+    # ------------------------------------------------------------------
+    if getattr(config, "augmentation_enabled", False):
+        factor = getattr(config, "augmentation_factor", 2)
+        noise_std = getattr(config, "augmentation_noise_std", 0.02)
+        X_train, y_train = augment_sequences(
+            X_train, y_train,
+            factor=factor,
+            noise_std=noise_std,
+        )
 
     if scaled_val is not None and len(scaled_val) > 0:
         _check_seq_viable(len(scaled_val), "Validation")

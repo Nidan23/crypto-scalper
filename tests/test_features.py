@@ -241,6 +241,15 @@ class TestBuildFeatures:
             "bb_bandwidth",
             "volume_ratio_20",
             "volume_roc_20",
+            "atr_14_norm",
+            "stoch_k_14",
+            "stoch_d_3",
+            "obv_ratio_20",
+            "ema_ratio_9_21",
+            "roc_5",
+            "roc_10",
+            "roc_20",
+            "hl_range_ratio",
         }
         assert set(result.columns) == expected
         assert len(result.columns) == len(expected)

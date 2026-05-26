@@ -99,6 +99,114 @@ def _bollinger(
     return {"bb_pctb": pctb, "bb_bandwidth": bandwidth}
 
 
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """Average True Range (Wilder's smoothing), normalized by close.
+
+    Args:
+        high: High price series.
+        low: Low price series.
+        close: Closing price series.
+        period: ATR lookback period.
+
+    Returns:
+        ATR / close — scale-invariant volatility measure.
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    return atr / close
+
+
+def _stochastic(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    k_period: int,
+    d_period: int,
+) -> Dict[str, pd.Series]:
+    """Stochastic oscillator %K and %D, normalized to [0, 1].
+
+    Args:
+        high: High price series.
+        low: Low price series.
+        close: Closing price series.
+        k_period: %K lookback window.
+        d_period: %D SMA window.
+
+    Returns:
+        Dict with keys ``stoch_k`` and ``stoch_d``, each in [0, 1].
+    """
+    lowest_low = low.rolling(window=k_period).min()
+    highest_high = high.rolling(window=k_period).max()
+    denom = highest_high - lowest_low
+    k_raw = (close - lowest_low) / denom.replace(0.0, np.nan)
+    d_raw = k_raw.rolling(window=d_period).mean()
+    return {"stoch_k": k_raw, "stoch_d": d_raw}
+
+
+def _obv_ratio(close: pd.Series, volume: pd.Series, period: int) -> pd.Series:
+    """On-Balance Volume ratio vs its rolling mean.
+
+    OBV is cumulative signed volume.  The ratio against its own MA makes it
+    stationary and comparable across regimes.
+
+    Args:
+        close: Closing price series.
+        volume: Volume series.
+        period: Rolling window for the OBV mean.
+
+    Returns:
+        OBV / OBV.rolling(period).mean().
+    """
+    direction = close.diff().apply(np.sign)
+    direction.iloc[0] = 1.0
+    obv = (direction * volume).cumsum()
+    obv_ma = obv.rolling(window=period).mean()
+    return obv / obv_ma.replace(0.0, np.nan)
+
+
+def _ema_ratio(close: pd.Series, fast: int, slow: int) -> pd.Series:
+    """EMA crossover ratio — EMA(fast) / EMA(slow).
+
+    Values > 1 indicate short-term trend above long-term (bullish);
+    values < 1 indicate bearish.
+
+    Args:
+        close: Closing price series.
+        fast: Fast EMA period.
+        slow: Slow EMA period.
+
+    Returns:
+        Series of EMA ratios.
+    """
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    return ema_fast / ema_slow.replace(0.0, np.nan)
+
+
+def _hl_range_ratio(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """Intra-candle volatility: (high - low) / close.
+
+    Large values indicate volatile candles relative to price level.
+
+    Args:
+        high: High price series.
+        low: Low price series.
+        close: Closing price series.
+
+    Returns:
+        (high - low) / close.
+    """
+    return (high - low) / close.replace(0.0, np.nan)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -182,6 +290,34 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     features["volume_ratio_20"] = volume / volume.rolling(window=20).mean()
     features["volume_roc_20"] = volume.pct_change(periods=20)
 
+    # --- ATR ---------------------------------------------------------------
+    atr_period = getattr(config, "atr_period", 14)
+    features["atr_14_norm"] = _atr(high, low, close, atr_period)
+
+    # --- Stochastic oscillator ---------------------------------------------
+    stoch_k = getattr(config, "stoch_k_period", 14)
+    stoch_d = getattr(config, "stoch_d_period", 3)
+    stoch = _stochastic(high, low, close, stoch_k, stoch_d)
+    features["stoch_k_14"] = stoch["stoch_k"]
+    features["stoch_d_3"] = stoch["stoch_d"]
+
+    # --- OBV ratio ---------------------------------------------------------
+    obv_period = getattr(config, "obv_period", 20)
+    features["obv_ratio_20"] = _obv_ratio(close, volume, obv_period)
+
+    # --- EMA crossover ratio -----------------------------------------------
+    ema_fast = getattr(config, "ema_fast", 9)
+    ema_slow = getattr(config, "ema_slow", 21)
+    features["ema_ratio_9_21"] = _ema_ratio(close, ema_fast, ema_slow)
+
+    # --- Price rate of change (ROC) ----------------------------------------
+    roc_periods = getattr(config, "roc_periods", [5, 10, 20])
+    for p in roc_periods:
+        features[f"roc_{p}"] = close.pct_change(periods=p)
+
+    # --- High-low range ratio ----------------------------------------------
+    features["hl_range_ratio"] = _hl_range_ratio(high, low, close)
+
     # --- Clean NaNs --------------------------------------------------------
     # Forward-fill first (catches any internal NaNs from edge cases), then
     # drop remaining rows that still have NaN (locked-in leading windows).
@@ -200,29 +336,32 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
-def build_target(df: pd.DataFrame) -> pd.Series:
+def build_target(df: pd.DataFrame, forward_periods: int = 1) -> pd.Series:
     """Build binary target series from OHLCV data.
 
-    The target at row *t* is ``1`` if the next candle's close is strictly
-    greater than the current close, otherwise ``0``.  The last row of the
-    returned series is always NaN (no next candle to compare against).
+    The target at row *t* is ``1`` if the close *forward_periods* candles
+    ahead is strictly greater than the current close, otherwise ``0``.
+    The last *forward_periods* rows are always NaN.
+
+    A longer forward window (e.g. 5 for 1m candles) reduces micro-noise
+    and gives the LSTM a smoother, more learnable signal.
 
     Args:
         df: OHLCV DataFrame (must contain a ``'close'`` column).
+        forward_periods: Number of candles to look ahead (default 1).
 
     Returns:
         Series with the same index as *df* and dtype ``float64``. Values are
-        ``1.0`` or ``0.0``; the last entry is ``NaN`` (no next candle to
-        compare against).
+        ``1.0`` or ``0.0``; the last *forward_periods* entries are NaN.
     """
     if "close" not in df.columns:
         raise ValueError("Input DataFrame must contain a 'close' column.")
     if df.empty:
         raise ValueError("Input DataFrame is empty.")
 
-    target = (df["close"].shift(-1) > df["close"]).astype(float)
-    # The last row has no "next candle", so it should be NaN.
-    target.iloc[-1] = np.nan
+    target = (df["close"].shift(-forward_periods) > df["close"]).astype(float)
+    # The last `forward_periods` rows have no future candle to compare against.
+    target.iloc[-forward_periods:] = np.nan
     return target
 
 

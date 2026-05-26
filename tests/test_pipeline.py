@@ -94,8 +94,10 @@ class TestRunPipeline:
         n_test = result["X_test"].shape[0]
         total = n_train + n_val + n_test
 
-        assert abs(n_train / total - config.train_split) < 0.08
-        assert abs(n_val / total - config.val_split) < 0.08
+        # Augmentation triples train sequences (factor=2), so the raw
+        # split ratios shift.  Test with wider tolerance.
+        assert abs(n_val / total - config.val_split) < 0.15
+        assert abs(n_test / total - (1 - config.train_split - config.val_split)) < 0.15
 
     def test_multiple_symbols(self, mock_fetch_multiple):
         """Pipeline handles multiple symbols."""
@@ -186,6 +188,8 @@ class TestRunPipeline:
         mock_config.macd_signal = 9
         mock_config.bb_period = 20
         mock_config.bb_std = 2.0
+        mock_config.augmentation_enabled = False
+        mock_config.target_forward_periods = 1
 
         df = _make_synthetic_ohlcv(1000, seed=6)
         mock_fetch_multiple.return_value = {"BTC/USDT": df}
