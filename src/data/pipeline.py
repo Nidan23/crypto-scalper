@@ -2,8 +2,14 @@
 
 Orchestrates fetching, feature engineering, normalisation, and sequence
 creation across one or more trading pairs.
+
+When ``config.orderbook_enabled`` is True, order-book microstructure
+features are fetched and merged with TA features.  If OB data is
+unavailable (no cached snapshots for the period, exchange error, etc.),
+the pipeline falls back gracefully to TA-only features.
 """
 
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -14,6 +20,77 @@ from src.config import config
 from src.data.augmentation import augment_sequences
 from src.data.fetcher import fetch_multiple
 from src.data.features import build_features, build_target, create_sequences, normalize_data
+from src.features.orderbook_features import aggregate_to_candles, compute_ob_features
+
+logger = logging.getLogger(__name__)
+
+
+def _merge_ob_features(
+    features: pd.DataFrame,
+    symbol: str,
+    raw_ohlcv: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attempt to fetch OB data and merge with TA features.
+
+    Args:
+        features: TA feature DataFrame (index = DatetimeIndex).
+        symbol: Trading pair string.
+        raw_ohlcv: Raw OHLCV DataFrame (for time-range reference).
+
+    Returns:
+        Merged DataFrame.  On failure or missing OB data, returns *features*
+        unchanged.
+    """
+    use_ob = getattr(config, "orderbook_enabled", False)
+    if not use_ob:
+        return features
+
+    try:
+        from src.data.orderbook import OrderBookFetcher
+
+        fetcher = OrderBookFetcher(
+            exchange_id=config.exchange_id,
+            depth=config.orderbook_depth,
+        )
+
+        # Time range from the feature index (after NaN trimming).
+        start_dt = features.index.min()
+        end_dt = features.index.max()
+
+        snapshots = fetcher.get_snapshots(symbol, start_dt, end_dt)
+
+        if snapshots.empty:
+            logger.info(
+                "No cached OB snapshots for %s in [%s, %s] — TA-only.",
+                symbol, start_dt, end_dt,
+            )
+            return features
+
+        # Compute per-snapshot features and aggregate to candle timestamps.
+        ob_feat = compute_ob_features(snapshots, depth=config.orderbook_depth)
+        if ob_feat.empty:
+            return features
+
+        ob_agg = aggregate_to_candles(ob_feat, features.index)
+
+        # Merge with TA features on index.
+        merged = features.join(ob_agg, how="left")
+        ob_cols = [c for c in ob_agg.columns if c not in features.columns]
+
+        logger.info(
+            "Merged %d OB feature columns for %s — %d/%d candles have OB data.",
+            len(ob_cols), symbol,
+            ob_agg.dropna(how="all").dropna().notna().any(axis=1).sum(),
+            len(ob_agg),
+        )
+        return merged
+
+    except Exception as exc:
+        logger.warning(
+            "OB feature merge failed for %s: %s — falling back to TA-only.",
+            symbol, exc,
+        )
+        return features
 
 
 def run_pipeline(
@@ -24,11 +101,12 @@ def run_pipeline(
     Steps
     -----
     1. Fetch OHLCV data for each symbol via :func:`~src.data.fetcher.fetch_multiple`.
-    2. Build feature columns and binary targets per symbol.
-    3. Concatenate all symbols' feature/target data (pair-agnostic).
-    4. Time-series split into train / validation / test (no shuffle).
-    5. Normalise using a StandardScaler fit on the training split only.
-    6. Create sliding-window LSTM sequences.
+    2. Build TA feature columns and binary targets per symbol.
+    3. Optionally fetch OB data and merge with TA features.
+    4. Concatenate all symbols' feature/target data (pair-agnostic).
+    5. Time-series split into train / validation / test (no shuffle).
+    6. Normalise using a StandardScaler fit on the training split only.
+    7. Create sliding-window LSTM sequences.
 
     Args:
         symbols: List of trading pairs.  Defaults to ``config.symbols``.
@@ -88,7 +166,12 @@ def run_pipeline(
                 "indicator periods."
             )
 
-        all_feature_frames.append(features.loc[valid_idx])
+        features = features.loc[valid_idx]
+
+        # --- 2a. Merge OB features (best-effort) ------------------------------
+        features = _merge_ob_features(features, symbol, df)
+
+        all_feature_frames.append(features)
         all_target_series.append(targets.loc[valid_idx])
 
     # ------------------------------------------------------------------

@@ -55,6 +55,12 @@ class Config:
     take_profit_atr_mult: float = 3.0
     max_hold_candles: int = 15  # 15 min on 1m candles
 
+    # Order book
+    orderbook_enabled: bool = True
+    orderbook_depth: int = 20
+    orderbook_snapshot_interval: int = 10  # seconds between snapshots
+    orderbook_cache_dir: str = "ob_cache"
+
     # Paths
     model_dir: str = "models"
     data_dir: str = "data_cache"

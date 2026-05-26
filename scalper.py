@@ -34,6 +34,10 @@ def main() -> None:
     bt.add_argument("--leverage", type=float, default=None,
                     help="Leverage multiplier. Position size = 2%% base × leverage. "
                          "(default: use config value)")
+    bt.add_argument("--no-orderbook", action="store_true",
+                    help="Disable order book features (TA-only, backward compat)")
+    bt.add_argument("--orderbook-depth", type=int, default=None,
+                    help="Order book depth levels (default: 20)")
 
     # ── train ─────────────────────────────────────────────────────────
     tr = sub.add_parser("train", help="Fetch data + train the LSTM model")
@@ -67,6 +71,10 @@ def main() -> None:
         config.timeframe = args.timeframe
     if getattr(args, "leverage", None) is not None:
         config.position_size_pct = 0.02 * args.leverage
+    if getattr(args, "no_orderbook", False):
+        config.orderbook_enabled = False
+    if getattr(args, "orderbook_depth", None) is not None:
+        config.orderbook_depth = args.orderbook_depth
 
     # ── build a namespace matching what the old handlers expect ───────
     ns = argparse.Namespace(

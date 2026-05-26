@@ -185,9 +185,12 @@ def handle_backtest(args: argparse.Namespace) -> None:
 
     # --- Model accuracy metrics on test set ---
     model_metrics = compute_model_metrics(data["y_test"], test_probs)
+    n_features = len(data["feature_names"])
+    ob_enabled = getattr(config, "orderbook_enabled", False)
     print(f"\n{'=' * 52}")
     print(f"  MODEL ACCURACY (TEST SET)")
     print(f"{'=' * 52}")
+    print(f"  Features:         {n_features:>8d}  (OB: {'on' if ob_enabled else 'off'})")
     print(f"  Accuracy:         {model_metrics['accuracy']:>8.4f}")
     print(f"  Precision:        {model_metrics['precision']:>8.4f}")
     print(f"  Recall:           {model_metrics['recall']:>8.4f}")
