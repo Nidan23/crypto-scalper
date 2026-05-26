@@ -82,6 +82,10 @@ def _merge_ob_features(
                 else:
                     cache_start = min(pqt_dates)
                     cache_end = max(pqt_dates)
+                    # Normalize: filename dates are naive; OHLCV index is UTC.
+                    if start_dt.tz is not None:
+                        cache_start = cache_start.tz_localize(start_dt.tz)
+                        cache_end = cache_end.tz_localize(start_dt.tz)
                     if end_dt < cache_start or start_dt > cache_end:
                         logger.debug(
                             "Bybit OB cache [%s, %s] does not cover requested [%s, %s] — skipping.",
@@ -261,6 +265,14 @@ def run_pipeline(
     # different symbols may overlap).
     combined_features = combined_features.reset_index(drop=True)
     combined_targets = combined_targets.reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # 3a. Fill NaN values from OB feature gaps (forward-fill, then zero)
+    # ------------------------------------------------------------------
+    nan_count = combined_features.isna().sum().sum()
+    if nan_count > 0:
+        combined_features = combined_features.ffill().fillna(0.0)
+        logger.info("Filled %d NaN values (ffill → 0) in feature matrix.", nan_count)
 
     n_total = len(combined_features)
     if n_total == 0:

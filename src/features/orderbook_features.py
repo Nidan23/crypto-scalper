@@ -221,7 +221,13 @@ def aggregate_to_candles(
         return pd.DataFrame(index=candle_timestamps, columns=cols)
 
     bins = candle_timestamps.sort_values()
-    indices = bins.searchsorted(ob_features.index, side="right") - 1
+    ob_idx = ob_features.index
+    # Normalize timezones: if one is naive and the other tz-aware, localize.
+    if bins.tz is None and ob_idx.tz is not None:
+        ob_idx = ob_idx.tz_localize(None)
+    elif bins.tz is not None and ob_idx.tz is None:
+        ob_idx = ob_idx.tz_localize(bins.tz)
+    indices = bins.searchsorted(ob_idx, side="right") - 1
     valid = (indices >= 0) & (indices < len(bins))
     if not valid.any():
         result = pd.DataFrame(index=candle_timestamps)

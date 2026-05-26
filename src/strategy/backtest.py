@@ -17,6 +17,7 @@ def run_backtest(
     y_test: np.ndarray,
     ohlcv_test: Dict[str, pd.DataFrame],
     initial_capital: float = 10000.0,
+    regime: str = "off",
 ) -> dict:
     """Run a walk-forward backtest simulation.
 
@@ -36,6 +37,7 @@ def run_backtest(
             period.  Each DataFrame must have at least as many rows as
             ``len(predictions[symbol])`` for that symbol.
         initial_capital: Starting capital in quote currency.
+        regime: Regime gate mode string passed through to signals.
 
     Returns:
         Dict with keys:
@@ -111,7 +113,7 @@ def run_backtest(
             continue
 
         # Generate and enrich signals.
-        signals = generate_signals(current_predictions, current_ohlcv)
+        signals = generate_signals(current_predictions, current_ohlcv, regime=regime)
         signals = apply_risk_management(signals, cash, current_ohlcv)
 
         # ------------------------------------------------------------------

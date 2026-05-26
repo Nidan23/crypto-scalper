@@ -399,11 +399,11 @@ def normalize_data(
     scaled_train: np.ndarray = scaler.fit_transform(train_df.values)
 
     scaled_val: Optional[np.ndarray] = None
-    if val_df is not None:
+    if val_df is not None and not val_df.empty:
         scaled_val = scaler.transform(val_df.values)
 
     scaled_test: Optional[np.ndarray] = None
-    if test_df is not None:
+    if test_df is not None and not test_df.empty:
         scaled_test = scaler.transform(test_df.values)
 
     return scaled_train, scaled_val, scaled_test, (scaler, feature_columns)

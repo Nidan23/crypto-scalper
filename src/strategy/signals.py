@@ -11,6 +11,7 @@ from src.config import config
 def generate_signals(
     predictions: Dict[str, tuple[float, float]],
     ohlcv_dict: Dict[str, pd.DataFrame],
+    regime: str = "off",
 ) -> List[dict]:
     """Convert model predictions to trade signals.
 
@@ -24,12 +25,13 @@ def generate_signals(
             both values are in ``[0, 1]`` and sum to 1.
         ohlcv_dict: Dict mapping symbol -> OHLCV DataFrame.  The last row
             of each DataFrame provides the entry price and timestamp.
+        regime: Regime gate mode string (``"strict"``, ``"loose"``, ``"off"``).
 
     Returns:
         List of signal dicts, each with keys:
             ``symbol``, ``direction`` (``"long"``|``"short"``),
             ``confidence`` (float), ``entry_price`` (float),
-            ``timestamp`` (datetime).
+            ``timestamp`` (datetime), ``regime`` (str).
     """
     signals: List[dict] = []
     for symbol, (prob_up, prob_down) in predictions.items():
@@ -47,6 +49,7 @@ def generate_signals(
                 "confidence": prob_up,
                 "entry_price": entry_price,
                 "timestamp": timestamp,
+                "regime": regime,
             })
         elif prob_up <= config.confidence_threshold_short:
             signals.append({
@@ -55,6 +58,7 @@ def generate_signals(
                 "confidence": prob_down,
                 "entry_price": entry_price,
                 "timestamp": timestamp,
+                "regime": regime,
             })
 
     return signals

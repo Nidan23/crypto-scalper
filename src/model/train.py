@@ -122,9 +122,22 @@ def train_model(
     n_train = len(X_train)
     n_val = len(X_val)
 
-    if n_train == 0 or n_val == 0:
-        raise ValueError(
-            f"Training data is empty: n_train={n_train}, n_val={n_val}"
+    if n_train == 0:
+        raise ValueError("Training data is empty: n_train=0")
+
+    # If no explicit validation set, carve 10% from training data.
+    if n_val == 0:
+        split_idx = int(n_train * 0.9)
+        X_val = X_train[split_idx:]
+        y_val = y_train[split_idx:]
+        X_train = X_train[:split_idx]
+        y_train = y_train[:split_idx]
+        n_train = len(X_train)
+        n_val = len(X_val)
+        logger.info(
+            "No validation set provided — using last %d training samples "
+            "(%.0f%%) for validation.",
+            n_val, 100 * n_val / (n_train + n_val),
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

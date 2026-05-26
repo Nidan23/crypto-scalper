@@ -65,9 +65,8 @@ def fetch_ohlcv(
     re-fetching identical requests.  Cache invalidation is manual (delete the
     cache directory or individual parquet files).
 
-    Retry behaviour: up to 3 attempts on network-level errors with
-    exponential backoff (1 s, 2 s, 4 s).  A 1-second pause is always applied
-    before each exchange call for basic rate limiting.
+    Paginates automatically when *limit* exceeds the exchange's per-request
+    cap (typically 1000 for Binance).
 
     Args:
         symbol: Trading pair, e.g. ``"BTC/USDT"``, ``"ETH/GBP"``, ``"SOL/EUR"``.
@@ -96,7 +95,6 @@ def fetch_ohlcv(
             df: pd.DataFrame = pd.read_parquet(cache)
             return df
         except Exception:
-            # Corrupt cache file; fall through to re-fetch.
             pass
 
     # ------------------------------------------------------------------
@@ -112,44 +110,79 @@ def fetch_ohlcv(
         )
 
     # ------------------------------------------------------------------
-    # Fetch with retry
+    # Paginated fetch
     # ------------------------------------------------------------------
     max_retries = 3
-    last_exc: Optional[Exception] = None
+    per_request = 1000  # Binance/CCXT max
+    all_candles: List[list] = []
 
-    for attempt in range(max_retries):
-        try:
-            time.sleep(1.0)  # basic rate limiting
+    # Start from `limit` minutes ago, fetch forward in 1000-candle chunks.
+    start_ms = int(pd.Timestamp.now().timestamp() * 1000) - (limit * 60 * 1000)
+    since_ms = start_ms
 
-            ohlcv = exchange.fetch_ohlcv(
-                symbol, timeframe=timeframe, limit=limit
-            )
+    while len(all_candles) < limit:
+        last_exc: Optional[Exception] = None
 
-            df = pd.DataFrame(
-                ohlcv,
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
-            )
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-            df.set_index("timestamp", inplace=True)
-
-            # Cache (non-fatal on failure)
+        for attempt in range(max_retries):
             try:
-                df.to_parquet(cache)
-            except Exception:
-                pass
+                time.sleep(0.5)  # rate limit
+                batch = exchange.fetch_ohlcv(
+                    symbol,
+                    timeframe=timeframe,
+                    since=since_ms,
+                    limit=per_request,
+                )
+                break
+            except ccxt.NetworkError as e:
+                last_exc = e
+                if attempt < max_retries - 1:
+                    time.sleep(2.0 ** attempt)
+            except Exception as e:
+                last_exc = e
+                if attempt < max_retries - 1:
+                    time.sleep(2.0 ** attempt)
+        else:
+            if all_candles:
+                break  # partial data is better than nothing
+            raise RuntimeError(
+                f"Failed to fetch OHLCV for '{symbol}' on {exchange_id} "
+                f"after {max_retries} retries: {last_exc}"
+            )
 
-            return df
+        if not batch:
+            break  # no more data available
 
-        except ccxt.NetworkError as e:
-            last_exc = e
-            if attempt < max_retries - 1:
-                backoff = 2.0 ** attempt  # 1, 2, 4 seconds
-                time.sleep(backoff)
+        all_candles.extend(batch)
 
-    raise RuntimeError(
-        f"Failed to fetch OHLCV for '{symbol}' on {exchange_id} "
-        f"after {max_retries} retries: {last_exc}"
+        if len(batch) < per_request:
+            break  # reached present (exchange returned partial page)
+
+        # Advance past the newest candle in this batch.
+        since_ms = batch[-1][0] + 1
+
+    # ------------------------------------------------------------------
+    # Build DataFrame
+    # ------------------------------------------------------------------
+    if not all_candles:
+        raise RuntimeError(
+            f"No OHLCV data returned for '{symbol}' on {exchange_id}."
+        )
+
+    df = pd.DataFrame(
+        all_candles,
+        columns=["timestamp", "open", "high", "low", "close", "volume"],
     )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.drop_duplicates(subset="timestamp").set_index("timestamp")
+    df = df.sort_index()
+
+    # Cache
+    try:
+        df.to_parquet(cache)
+    except Exception:
+        pass
+
+    return df
 
 
 def fetch_multiple(

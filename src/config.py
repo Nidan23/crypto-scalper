@@ -14,16 +14,16 @@ class Config:
     timeframe: str = "1m"
 
     # Data
-    lookback_candles: int = 50000  # candles to fetch (~35 days of 1m data)
+    lookback_candles: int = 21000  # candles to fetch (~14 days of 1m data)
     target_forward_periods: int = 1  # predict next candle
     augmentation_enabled: bool = True
     augmentation_factor: int = 2  # copies per original sequence
     augmentation_noise_std: float = 0.02  # std dev of Gaussian jitter
-    train_split: float = 0.7
-    val_split: float = 0.15  # test gets remainder
-
+    train_split: float = 0.5
+    val_split: float = 0.0  # test gets remainder
+    
     # Features
-    seq_len: int = 60  # sequence length for LSTM input
+    seq_len: int = 30  # sequence length for LSTM input (reduced for smaller dataset)
     rsi_period: int = 14
     macd_fast: int = 12
     macd_slow: int = 26
@@ -44,7 +44,7 @@ class Config:
     dropout: float = 0.3
     batch_size: int = 32
     learning_rate: float = 0.001
-    num_epochs: int = 100
+    num_epochs: int = 50
     early_stopping_patience: int = 15
 
     # Trading
@@ -57,7 +57,7 @@ class Config:
 
     # Order book
     orderbook_enabled: bool = True
-    orderbook_depth: int = 20
+    orderbook_depth: int = 10
     orderbook_snapshot_interval: int = 10  # seconds between snapshots
     orderbook_cache_dir: str = "ob_cache"
 
@@ -65,7 +65,7 @@ class Config:
     bybit_ob_cache_dir: str = "ob_cache/bybit"
     bybit_ob_enabled: bool = True
     bybit_ob_symbol: str = "BTCUSDT"
-    bybit_ob_auto_sync: bool = True  # auto-download missing days before training
+    bybit_ob_auto_sync: bool = False  # auto-download missing days before training
 
     # Regime detection
     regime_mode: str = "off"  # "strict", "loose", "off"

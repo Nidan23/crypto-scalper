@@ -560,8 +560,13 @@ def load_bybit_ob_for_range(
                     logger.warning("Auto-sync failed: %s — using cached data only.", exc)
 
     # Find cached parquet files within the date range.
+    # Normalize to naive dates for file matching — Bybit cache files are
+    # stored by UTC date without timezone in filename.
+    tz_str = str(start_dt.tz) if start_dt.tz is not None else None
+    start_naive = start_dt.tz_localize(None) if start_dt.tz is not None else start_dt
+    end_naive = end_dt.tz_localize(None) if end_dt.tz is not None else end_dt
     date_range = pd.date_range(
-        start_dt.normalize(), end_dt.normalize(), freq="D", tz=start_dt.tz
+        start_naive.normalize(), end_naive.normalize(), freq="D"
     )
     frames: list[pd.DataFrame] = []
     for d in date_range:
@@ -579,6 +584,9 @@ def load_bybit_ob_for_range(
         return None
 
     result = pd.concat(frames).sort_index()
+    # Localize to UTC — Bybit timestamps are UTC but stored naive.
+    if result.index.tz is None:
+        result.index = result.index.tz_localize("UTC")
     # Filter to the exact time range.
     mask = (result.index >= start_dt) & (result.index <= end_dt)
     result = result.loc[mask]
