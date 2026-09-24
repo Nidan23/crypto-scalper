@@ -75,3 +75,14 @@ All configuration is symbol-independent. The system works with any CCXT-supporte
 - [ ] Real-time paper trading via WebSocket
 - [ ] Reinforcement learning agent for entry/exit optimization
 - [ ] Portfolio-level position sizing across multiple symbols
+
+## Disclaimer
+
+This is a research project, not financial advice. Nothing here is a
+recommendation to trade. Backtested results do not predict live performance —
+markets change, fees and slippage bite, and models overfit. If you run it with
+real capital, you do so entirely at your own risk.
+
+## License
+
+[MIT](LICENSE) © Jacob Sulkowski
